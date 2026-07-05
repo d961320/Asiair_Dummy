@@ -12,6 +12,8 @@ import android.os.Looper;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
+import android.widget.ScrollView;
+import android.widget.Toast;
 
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
@@ -114,14 +116,11 @@ public class FirstFragment extends Fragment {
             return;
         }
 
-        // SSID og kodeord er nu på 4 karakterer
         String targetSsid = "ASIA";
         String targetPassword = "1234";
 
         log("Prøver at konfigurere: " + targetSsid + " (Kode: " + targetPassword + ")");
-        log("Bemærk: 4-cifret kode kan blive afvist af systemet (kræver normalt 8).");
         
-        // Forsøg at sætte statisk konfiguration (Reflection)
         trySetStaticConfig(wifiManager, targetSsid, targetPassword);
 
         log("Anmoder systemet om hotspot...");
@@ -187,7 +186,6 @@ public class FirstFragment extends Fragment {
             config.allowedKeyManagement.set(WifiConfiguration.KeyMgmt.WPA_PSK);
             method.invoke(wifiManager, config);
         } catch (Exception ignored) {
-            // Metoden findes sandsynligvis ikke eller er blokeret
         }
     }
 
@@ -205,11 +203,7 @@ public class FirstFragment extends Fragment {
     private void startServers() {
         if (isServerRunning) return;
         isServerRunning = true;
-        
-        // Start TCP Server (Asiair Dummy)
         serverExecutor.execute(this::runTcpServer);
-        
-        // Start HTTP Server (Web Test)
         serverExecutor.execute(this::runHttpServer);
     }
 
@@ -218,7 +212,12 @@ public class FirstFragment extends Fragment {
             tcpServerSocket = new ServerSocket(4350);
             while (isServerRunning) {
                 try (Socket clientSocket = tcpServerSocket.accept()) {
-                    log("Enhed forbundet: " + clientSocket.getInetAddress());
+                    String clientIp = clientSocket.getInetAddress().toString();
+                    String msg = "FORBUNDET: " + clientIp;
+                    log(msg);
+                    showToast(msg);
+                    updateStatus("KLIENT: " + clientIp);
+                    
                     InputStream in = clientSocket.getInputStream();
                     OutputStream out = clientSocket.getOutputStream();
                     
@@ -228,14 +227,18 @@ public class FirstFragment extends Fragment {
                         String data = new String(buffer, 0, bytesRead);
                         log("MODTAGET: " + data.trim());
                         
-                        // Svar tilbage (Back and forth)
                         String response = "ASIAIR_ACK: OK\n";
                         out.write(response.getBytes());
                         out.flush();
                         log("SENDT: " + response.trim());
                     }
                 } catch (Exception e) {
-                    if (isServerRunning) log("TCP Klientfejl: " + e.getMessage());
+                    if (isServerRunning) {
+                        log("TCP Klient afbrudt: " + e.getMessage());
+                        if (hotspotReservation != null) {
+                            updateStatus("Aktiv: " + hotspotReservation.getWifiConfiguration().SSID);
+                        }
+                    }
                 }
             }
         } catch (Exception e) {
@@ -253,9 +256,11 @@ public class FirstFragment extends Fragment {
                     
                     String requestLine = in.readLine();
                     if (requestLine != null) {
-                        log("HTTP MODTAGET: " + requestLine);
+                        String msg = "HTTP Forespørgsel fra: " + clientSocket.getInetAddress();
+                        log(msg);
+                        showToast(msg);
                         
-                        String responseBody = "<html><body><h1>Asiair Dummy</h1><p>Test OK - 4 tegn SSID/Kode.</p></body></html>";
+                        String responseBody = "<html><body><h1>Asiair Dummy</h1><p>Test OK!</p></body></html>";
                         String response = "HTTP/1.1 200 OK\r\n" +
                                 "Content-Type: text/html; charset=utf-8\r\n" +
                                 "Content-Length: " + responseBody.getBytes().length + "\r\n" +
@@ -303,6 +308,21 @@ public class FirstFragment extends Fragment {
         new Handler(Looper.getMainLooper()).post(() -> {
             if (binding != null) {
                 binding.textviewLog.append(message + "\n");
+                // Auto-scroll til bunden
+                binding.textviewLog.post(() -> {
+                    View parent = (View) binding.textviewLog.getParent();
+                    if (parent instanceof ScrollView) {
+                        ((ScrollView) parent).fullScroll(View.FOCUS_DOWN);
+                    }
+                });
+            }
+        });
+    }
+
+    private void showToast(String message) {
+        new Handler(Looper.getMainLooper()).post(() -> {
+            if (getContext() != null) {
+                Toast.makeText(getContext(), message, Toast.LENGTH_SHORT).show();
             }
         });
     }
