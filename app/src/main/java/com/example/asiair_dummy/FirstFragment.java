@@ -44,7 +44,7 @@ public class FirstFragment extends Fragment {
 
     private FragmentFirstBinding binding;
     private WifiManager.LocalOnlyHotspotReservation hotspotReservation;
-    private final ExecutorService serverExecutor = Executors.newFixedThreadPool(2);
+    private final ExecutorService serverExecutor = Executors.newCachedThreadPool();
     private volatile boolean isServerRunning = false;
     private ServerSocket tcpServerSocket;
     private ServerSocket httpServerSocket;
@@ -119,12 +119,11 @@ public class FirstFragment extends Fragment {
         String targetSsid = "ASIA";
         String targetPassword = "1234";
 
-        log("Prøver at konfigurere: " + targetSsid + " (Kode: " + targetPassword + ")");
-        
+        log("Konfigurerer: " + targetSsid + " / 1234");
         trySetStaticConfig(wifiManager, targetSsid, targetPassword);
 
-        log("Anmoder systemet om hotspot...");
-        updateStatus("Status: Anmoder...");
+        log("Anmoder om hotspot...");
+        updateStatus("Status: Starter...");
         try {
             wifiManager.startLocalOnlyHotspot(new WifiManager.LocalOnlyHotspotCallback() {
                 @Override
@@ -135,17 +134,14 @@ public class FirstFragment extends Fragment {
                     String ssid = reservation.getWifiConfiguration().SSID;
                     String pwd = reservation.getWifiConfiguration().preSharedKey;
 
-                    log("HOTSPOT STARTET!");
-                    log("Forbind til SSID: " + ssid);
-                    log("Kodeord: " + pwd);
-                    
-                    if (!ssid.contains(targetSsid)) {
-                        log("Info: Android har valgt sit eget SSID/Kode pga. sikkerhed.");
-                    }
+                    log("HOTSPOT AKTIV!");
+                    log("SSID: " + ssid);
+                    log("KODE: " + pwd);
                     
                     String ip = getHotspotIpAddress();
-                    log("IP-adresse: " + ip);
-                    log("TCP Server på port 4350");
+                    log("IP: " + ip);
+                    log("Port 4350: Hybrid (Web + TCP)");
+                    log("Port 8080: Web kun");
 
                     updateStatus("Aktiv: " + ssid);
                     updateButtonText("Stop Hotspot");
@@ -165,15 +161,14 @@ public class FirstFragment extends Fragment {
                 @Override
                 public void onFailed(int reason) {
                     super.onFailed(reason);
-                    log("Hotspot fejlede. Kode: " + reason);
-                    updateStatus("Status: Fejl (" + reason + ")");
+                    log("Fejl: " + reason);
+                    updateStatus("Fejl: " + reason);
                     hotspotReservation = null;
                     updateButtonText("Start ASIA Hotspot");
                 }
             }, new Handler(Looper.getMainLooper()));
         } catch (SecurityException e) {
             log("Sikkerhedsfejl: " + e.getMessage());
-            updateStatus("Status: Tilladelsesfejl");
         }
     }
 
@@ -191,13 +186,12 @@ public class FirstFragment extends Fragment {
 
     private void stopHotspot() {
         if (hotspotReservation != null) {
-            log("Stopper Hotspot...");
             hotspotReservation.close();
             hotspotReservation = null;
-            updateStatus("Status: Idle");
-            updateButtonText("Start ASIA Hotspot");
-            stopServers();
         }
+        stopServers();
+        updateStatus("Status: Idle");
+        updateButtonText("Start ASIA Hotspot");
     }
 
     private void startServers() {
@@ -211,38 +205,70 @@ public class FirstFragment extends Fragment {
         try {
             tcpServerSocket = new ServerSocket(4350);
             while (isServerRunning) {
-                try (Socket clientSocket = tcpServerSocket.accept()) {
-                    String clientIp = clientSocket.getInetAddress().toString();
-                    String msg = "FORBUNDET: " + clientIp;
-                    log(msg);
-                    showToast(msg);
-                    updateStatus("KLIENT: " + clientIp);
-                    
-                    InputStream in = clientSocket.getInputStream();
-                    OutputStream out = clientSocket.getOutputStream();
-                    
-                    byte[] buffer = new byte[1024];
-                    int bytesRead;
-                    while ((bytesRead = in.read(buffer)) != -1) {
-                        String data = new String(buffer, 0, bytesRead);
-                        log("MODTAGET: " + data.trim());
-                        
-                        String response = "ASIAIR_ACK: OK\n";
-                        out.write(response.getBytes());
-                        out.flush();
-                        log("SENDT: " + response.trim());
-                    }
-                } catch (Exception e) {
-                    if (isServerRunning) {
-                        log("TCP Klient afbrudt: " + e.getMessage());
-                        if (hotspotReservation != null) {
-                            updateStatus("Aktiv: " + hotspotReservation.getWifiConfiguration().SSID);
-                        }
-                    }
-                }
+                Socket clientSocket = tcpServerSocket.accept();
+                serverExecutor.execute(() -> handleTcpClient(clientSocket));
             }
         } catch (Exception e) {
             if (isServerRunning) log("TCP Serverfejl: " + e.getMessage());
+        }
+    }
+
+    private void handleTcpClient(Socket clientSocket) {
+        String clientIp = clientSocket.getInetAddress().getHostAddress();
+        try (Socket s = clientSocket;
+             InputStream in = s.getInputStream();
+             OutputStream out = s.getOutputStream()) {
+
+            log("Forbindelse på 4350 fra: " + clientIp);
+            showToast("Ny klient: " + clientIp);
+            updateStatus("KLIENT: " + clientIp);
+
+            byte[] buffer = new byte[4096];
+            // Vi venter på første data for at se om det er en browser
+            int bytesRead = in.read(buffer);
+            if (bytesRead == -1) return;
+
+            String received = new String(buffer, 0, bytesRead);
+            
+            if (received.startsWith("GET ") || received.startsWith("POST ")) {
+                // DET ER EN BROWSER! Send korrekt HTTP svar.
+                log("HTTP forespørgsel detekteret på 4350.");
+                String body = "<html><body style='font-family:sans-serif; text-align:center;'>" +
+                        "<h1>Asiair Dummy - Port 4350</h1>" +
+                        "<p style='color:green; font-size:24px;'>FORBINDELSE VIRKER!</p>" +
+                        "<p>Serveren modtog din browser-forespørgsel korrekt.</p>" +
+                        "</body></html>";
+                
+                String header = "HTTP/1.1 200 OK\r\n" +
+                        "Content-Type: text/html; charset=utf-8\r\n" +
+                        "Content-Length: " + body.getBytes().length + "\r\n" +
+                        "Connection: close\r\n\r\n";
+                
+                out.write(header.getBytes());
+                out.write(body.getBytes());
+                out.flush();
+                log("HTTP svar sendt til " + clientIp);
+            } else {
+                // DET ER EN RÅ TCP KLIENT (Terminal/Asiair App)
+                log("Rå TCP data fra " + clientIp + ": " + received.trim());
+                String ack = "ASIAIR_ACK: Modtaget '" + received.trim() + "'\n";
+                out.write(ack.getBytes());
+                out.flush();
+
+                while (isServerRunning && (bytesRead = in.read(buffer)) != -1) {
+                    String data = new String(buffer, 0, bytesRead);
+                    log("MODTAGET: " + data.trim());
+                    String response = "ASIAIR_ACK: " + data.trim() + "\n";
+                    out.write(response.getBytes());
+                    out.flush();
+                }
+            }
+        } catch (Exception e) {
+            log("Forbindelse lukket: " + clientIp);
+        } finally {
+            if (hotspotReservation != null) {
+                updateStatus("Aktiv: " + hotspotReservation.getWifiConfiguration().SSID);
+            }
         }
     }
 
@@ -253,26 +279,18 @@ public class FirstFragment extends Fragment {
                 try (Socket clientSocket = httpServerSocket.accept()) {
                     BufferedReader in = new BufferedReader(new InputStreamReader(clientSocket.getInputStream()));
                     OutputStream out = clientSocket.getOutputStream();
-                    
-                    String requestLine = in.readLine();
-                    if (requestLine != null) {
-                        String msg = "HTTP Forespørgsel fra: " + clientSocket.getInetAddress();
-                        log(msg);
-                        showToast(msg);
-                        
-                        String responseBody = "<html><body><h1>Asiair Dummy</h1><p>Test OK!</p></body></html>";
+                    if (in.readLine() != null) {
+                        String clientIp = clientSocket.getInetAddress().getHostAddress();
+                        log("HTTP besøg på 8080 fra: " + clientIp);
+                        String body = "<html><body><h1>Asiair Dummy Port 8080</h1><p>Test OK!</p></body></html>";
                         String response = "HTTP/1.1 200 OK\r\n" +
                                 "Content-Type: text/html; charset=utf-8\r\n" +
-                                "Content-Length: " + responseBody.getBytes().length + "\r\n" +
-                                "Connection: close\r\n\r\n" +
-                                responseBody;
-                        
+                                "Content-Length: " + body.getBytes().length + "\r\n" +
+                                "Connection: close\r\n\r\n" + body;
                         out.write(response.getBytes());
                         out.flush();
                     }
-                } catch (Exception e) {
-                    if (isServerRunning) log("HTTP Klientfejl: " + e.getMessage());
-                }
+                } catch (Exception ignored) {}
             }
         } catch (Exception e) {
             if (isServerRunning) log("HTTP Serverfejl: " + e.getMessage());
@@ -289,11 +307,9 @@ public class FirstFragment extends Fragment {
 
     private String getHotspotIpAddress() {
         try {
-            List<NetworkInterface> interfaces = Collections.list(NetworkInterface.getNetworkInterfaces());
-            for (NetworkInterface intf : interfaces) {
+            for (NetworkInterface intf : Collections.list(NetworkInterface.getNetworkInterfaces())) {
                 if (intf.getName().contains("wlan") || intf.getName().contains("ap")) {
-                    List<InetAddress> addrs = Collections.list(intf.getInetAddresses());
-                    for (InetAddress addr : addrs) {
+                    for (InetAddress addr : Collections.list(intf.getInetAddresses())) {
                         if (!addr.isLoopbackAddress() && addr.getHostAddress().indexOf(':') < 0) {
                             return addr.getHostAddress();
                         }
@@ -308,7 +324,6 @@ public class FirstFragment extends Fragment {
         new Handler(Looper.getMainLooper()).post(() -> {
             if (binding != null) {
                 binding.textviewLog.append(message + "\n");
-                // Auto-scroll til bunden
                 binding.textviewLog.post(() -> {
                     View parent = (View) binding.textviewLog.getParent();
                     if (parent instanceof ScrollView) {
