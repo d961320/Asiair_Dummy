@@ -1,14 +1,18 @@
 package com.example.asiair_dummy;
 
 import android.Manifest;
+import android.content.ContentUris;
 import android.content.Context;
 import android.content.pm.PackageManager;
+import android.database.Cursor;
+import android.net.Uri;
 import android.net.wifi.WifiConfiguration;
 import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.MediaStore;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
@@ -51,11 +55,17 @@ public class FirstFragment extends Fragment {
 
     private final ActivityResultLauncher<String[]> requestPermissionLauncher =
             registerForActivityResult(new ActivityResultContracts.RequestMultiplePermissions(), result -> {
-                Boolean fineLocationGranted = result.getOrDefault(Manifest.permission.ACCESS_FINE_LOCATION, false);
-                if (fineLocationGranted != null && fineLocationGranted) {
+                boolean allGranted = true;
+                for (Boolean granted : result.values()) {
+                    if (!granted) {
+                        allGranted = false;
+                        break;
+                    }
+                }
+                if (allGranted) {
                     startHotspot();
                 } else {
-                    log("Tilladelse afvist. Kan ikke starte hotspot.");
+                    log("Tilladelser afvist. Kan ikke starte hotspot eller vise billeder.");
                 }
             });
 
@@ -91,6 +101,9 @@ public class FirstFragment extends Fragment {
         permissions.add(Manifest.permission.ACCESS_FINE_LOCATION);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             permissions.add(Manifest.permission.NEARBY_WIFI_DEVICES);
+            permissions.add(Manifest.permission.READ_MEDIA_IMAGES);
+        } else {
+            permissions.add(Manifest.permission.READ_EXTERNAL_STORAGE);
         }
 
         boolean allGranted = true;
@@ -140,8 +153,7 @@ public class FirstFragment extends Fragment {
                     
                     String ip = getHotspotIpAddress();
                     log("IP: " + ip);
-                    log("Port 4350: Hybrid (Web + TCP)");
-                    log("Port 8080: Web kun");
+                    log("Gå til http://" + ip + ":4350 for at se billeder");
 
                     updateStatus("Aktiv: " + ssid);
                     updateButtonText("Stop Hotspot");
@@ -219,57 +231,129 @@ public class FirstFragment extends Fragment {
              InputStream in = s.getInputStream();
              OutputStream out = s.getOutputStream()) {
 
-            log("Forbindelse på 4350 fra: " + clientIp);
-            showToast("Ny klient: " + clientIp);
+            log("Forbindelse fra: " + clientIp);
             updateStatus("KLIENT: " + clientIp);
 
-            byte[] buffer = new byte[4096];
-            // Vi venter på første data for at se om det er en browser
+            byte[] buffer = new byte[8192];
             int bytesRead = in.read(buffer);
             if (bytesRead == -1) return;
 
             String received = new String(buffer, 0, bytesRead);
             
-            if (received.startsWith("GET ") || received.startsWith("POST ")) {
-                // DET ER EN BROWSER! Send korrekt HTTP svar.
-                log("HTTP forespørgsel detekteret på 4350.");
-                String body = "<html><body style='font-family:sans-serif; text-align:center;'>" +
-                        "<h1>Asiair Dummy - Port 4350</h1>" +
-                        "<p style='color:green; font-size:24px;'>FORBINDELSE VIRKER!</p>" +
-                        "<p>Serveren modtog din browser-forespørgsel korrekt.</p>" +
-                        "</body></html>";
+            if (received.startsWith("GET /img?id=")) {
+                // SERVER ET BILLEDE
+                String idStr = received.split("id=")[1].split(" ")[0];
+                long id = Long.parseLong(idStr);
+                serveImage(id, out);
+            } else if (received.startsWith("GET ")) {
+                // VIS GALLERI
+                log("Sender billedgalleri til " + clientIp);
+                String body = generateGalleryHtml();
                 
                 String header = "HTTP/1.1 200 OK\r\n" +
                         "Content-Type: text/html; charset=utf-8\r\n" +
-                        "Content-Length: " + body.getBytes().length + "\r\n" +
+                        "Content-Length: " + body.getBytes("UTF-8").length + "\r\n" +
                         "Connection: close\r\n\r\n";
                 
-                out.write(header.getBytes());
-                out.write(body.getBytes());
+                out.write(header.getBytes("UTF-8"));
+                out.write(body.getBytes("UTF-8"));
                 out.flush();
-                log("HTTP svar sendt til " + clientIp);
             } else {
-                // DET ER EN RÅ TCP KLIENT (Terminal/Asiair App)
-                log("Rå TCP data fra " + clientIp + ": " + received.trim());
-                String ack = "ASIAIR_ACK: Modtaget '" + received.trim() + "'\n";
-                out.write(ack.getBytes());
-                out.flush();
-
+                // RÅ TCP
+                log("Rå TCP fra " + clientIp);
+                out.write("VELKOMMEN TIL ASIAIR DUMMY\n".getBytes());
                 while (isServerRunning && (bytesRead = in.read(buffer)) != -1) {
-                    String data = new String(buffer, 0, bytesRead);
-                    log("MODTAGET: " + data.trim());
-                    String response = "ASIAIR_ACK: " + data.trim() + "\n";
-                    out.write(response.getBytes());
-                    out.flush();
+                    out.write(("ACK: " + new String(buffer, 0, bytesRead)).getBytes());
                 }
             }
         } catch (Exception e) {
-            log("Forbindelse lukket: " + clientIp);
+            log("Forbindelse lukket: " + clientIp + " (" + e.getMessage() + ")");
         } finally {
             if (hotspotReservation != null) {
-                updateStatus("Aktiv: " + hotspotReservation.getWifiConfiguration().SSID);
+                new Handler(Looper.getMainLooper()).post(() -> {
+                    if (binding != null) updateStatus("Aktiv: " + hotspotReservation.getWifiConfiguration().SSID);
+                });
             }
         }
+    }
+
+    private String generateGalleryHtml() {
+        StringBuilder html = new StringBuilder();
+        html.append("<!DOCTYPE html><html><head><meta charset=\"UTF-8\">");
+        html.append("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">");
+        html.append("<style>body{font-family:sans-serif;text-align:center;background:#f0f0f0;margin:0;padding:20px;}");
+        html.append(".gallery{display:flex;flex-wrap:wrap;justify-content:center;gap:15px;}");
+        html.append(".img-container{background:white;padding:10px;border-radius:8px;box-shadow:0 2px 5px rgba(0,0,0,0.1);width:150px;}");
+        html.append("img{max-width:100%;height:auto;border-radius:4px;}");
+        html.append("h1{color:#d32f2f;}</style></head><body>");
+        html.append("<h1>Mobil Billeder</h1><div class='gallery'>");
+
+        List<ImageInfo> images = getImagesFromPhone();
+        if (images.isEmpty()) {
+            html.append("<p>Ingen billeder fundet eller mangler tilladelse.</p>");
+        } else {
+            for (ImageInfo img : images) {
+                html.append("<div class='img-container'>");
+                html.append("<img src='/img?id=").append(img.id).append("' />");
+                html.append("<p style='font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;'>").append(img.name).append("</p>");
+                html.append("</div>");
+            }
+        }
+
+        html.append("</div></body></html>");
+        return html.toString();
+    }
+
+    private void serveImage(long id, OutputStream out) {
+        Uri contentUri = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id);
+        try (InputStream imageStream = requireContext().getContentResolver().openInputStream(contentUri)) {
+            if (imageStream == null) return;
+            
+            // Vi gætter på det er en JPEG
+            String header = "HTTP/1.1 200 OK\r\n" +
+                    "Content-Type: image/jpeg\r\n" +
+                    "Connection: close\r\n\r\n";
+            out.write(header.getBytes());
+
+            byte[] buffer = new byte[8192];
+            int bytesRead;
+            while ((bytesRead = imageStream.read(buffer)) != -1) {
+                out.write(buffer, 0, bytesRead);
+            }
+            out.flush();
+        } catch (Exception e) {
+            log("Kunne ikke sende billede " + id + ": " + e.getMessage());
+        }
+    }
+
+    private List<ImageInfo> getImagesFromPhone() {
+        List<ImageInfo> list = new ArrayList<>();
+        String[] projection = {MediaStore.Images.Media._ID, MediaStore.Images.Media.DISPLAY_NAME};
+        
+        try (Cursor cursor = requireContext().getContentResolver().query(
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                projection, null, null, MediaStore.Images.Media.DATE_ADDED + " DESC")) {
+            
+            if (cursor != null) {
+                int idColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID);
+                int nameColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME);
+                
+                while (cursor.moveToNext() && list.size() < 24) { // Begræns til 24 billeder
+                    long id = cursor.getLong(idColumn);
+                    String name = cursor.getString(nameColumn);
+                    list.add(new ImageInfo(id, name));
+                }
+            }
+        } catch (Exception e) {
+            log("Cursor fejl: " + e.getMessage());
+        }
+        return list;
+    }
+
+    private static class ImageInfo {
+        long id;
+        String name;
+        ImageInfo(long id, String name) { this.id = id; this.name = name; }
     }
 
     private void runHttpServer() {
@@ -280,21 +364,13 @@ public class FirstFragment extends Fragment {
                     BufferedReader in = new BufferedReader(new InputStreamReader(clientSocket.getInputStream()));
                     OutputStream out = clientSocket.getOutputStream();
                     if (in.readLine() != null) {
-                        String clientIp = clientSocket.getInetAddress().getHostAddress();
-                        log("HTTP besøg på 8080 fra: " + clientIp);
-                        String body = "<html><body><h1>Asiair Dummy Port 8080</h1><p>Test OK!</p></body></html>";
-                        String response = "HTTP/1.1 200 OK\r\n" +
-                                "Content-Type: text/html; charset=utf-8\r\n" +
-                                "Content-Length: " + body.getBytes().length + "\r\n" +
-                                "Connection: close\r\n\r\n" + body;
+                        String body = "<html><body><h1>Asiair Dummy 8080</h1><p>Brug port 4350 for billeder.</p></body></html>";
+                        String response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: " + body.length() + "\r\n\r\n" + body;
                         out.write(response.getBytes());
-                        out.flush();
                     }
                 } catch (Exception ignored) {}
             }
-        } catch (Exception e) {
-            if (isServerRunning) log("HTTP Serverfejl: " + e.getMessage());
-        }
+        } catch (Exception ignored) {}
     }
 
     private void stopServers() {
